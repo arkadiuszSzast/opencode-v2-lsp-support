@@ -19,7 +19,7 @@ export default {
 
     const manager = new LspManager(settings, root)
     const tools = await ctx.tool.transform((editor: any) => editor.add(lspTool(manager, root)))
-    const hook = await ctx.tool.hook("execute.after", afterTool(manager, root, settings.diagnostics))
+    const hook = await ctx.tool.hook("execute.after", afterTool(manager, root, settings.diagnostics, settings.servers))
     return async () => {
       await hook.dispose()
       await tools.dispose()

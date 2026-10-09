@@ -2,7 +2,7 @@ import { stat } from "node:fs/promises"
 import { isAbsolute, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { Diagnostic } from "./client.ts"
-import { isRecord } from "./config.ts"
+import { isRecord, type ServerConfig } from "./config.ts"
 import { diagnosticsReport, displayPath, errorsOnly } from "./format.ts"
 import { insideProject, type LspManager } from "./manager.ts"
 
@@ -23,8 +23,14 @@ interface Completed {
  * in the background so the first edit does not wait for a cold start. Deleted
  * and moved-away files are closed so servers stop analyzing their old contents.
  */
-export function afterTool(manager: LspManager, root: string, diagnostics: boolean) {
+export function afterTool(manager: LspManager, root: string, diagnostics: boolean, servers: readonly ServerConfig[] = []) {
+  const warmed = new Set<string>()
   return async (event: { tool: string; status: string; input: unknown; agent?: string }) => {
+    for (const server of servers) {
+      if (!server.prewarm || warmed.has(server.id) || !event.agent || !server.prewarm.agents.includes(event.agent)) continue
+      warmed.add(server.id)
+      void manager.prewarm(server, absolute(root, server.prewarm.file))
+    }
     if (event.status !== "completed") return
     if (event.tool === "read") return warm(manager, root, event.input, event.agent)
     if (!MUTATING_TOOLS.has(event.tool)) return

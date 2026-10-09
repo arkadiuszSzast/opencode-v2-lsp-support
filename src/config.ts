@@ -13,6 +13,8 @@ export interface ServerConfig {
   readonly initialization?: Record<string, unknown>
   /** Agents allowed to use this server; undefined allows every agent. */
   readonly agents?: string[]
+  /** Start the server in the background once any of these agents runs a tool, for the project holding `file`. */
+  readonly prewarm?: { readonly agents: string[]; readonly file: string }
 }
 
 export interface Settings {
@@ -166,6 +168,10 @@ function resolveServers(lsp: unknown, debug: boolean): ServerConfig[] {
       env: isRecord(entry.env) ? Object.fromEntries(Object.entries(entry.env).filter((pair): pair is [string, string] => typeof pair[1] === "string")) : {},
       initialization: isRecord(entry.initialization) ? entry.initialization : undefined,
       agents: Array.isArray(entry.agents) ? strings(entry.agents) : undefined,
+      prewarm:
+        isRecord(entry.prewarm) && typeof entry.prewarm.file === "string" && strings(entry.prewarm.agents).length > 0
+          ? { agents: strings(entry.prewarm.agents), file: entry.prewarm.file }
+          : undefined,
     })
   }
   return servers

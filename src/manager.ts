@@ -166,12 +166,30 @@ export class LspManager {
   async #targets(file: string, agent?: string): Promise<Target[]> {
     const targets: Target[] = []
     for (const server of this.serversFor(file, agent)) {
-      const root = await serverRoot(server.id, file, this.#root)
-      if (!root) continue
-      const key = root === this.#root ? server.id : `${server.id} (${relative(this.#root, root)})`
-      targets.push({ key, server, root })
+      const target = await this.#target(server, file)
+      if (target) targets.push(target)
     }
     return targets
+  }
+
+  async #target(server: ServerConfig, file: string): Promise<Target | undefined> {
+    const root = await serverRoot(server.id, file, this.#root)
+    if (!root) return undefined
+    const key = root === this.#root ? server.id : `${server.id} (${relative(this.#root, root)})`
+    return { key, server, root }
+  }
+
+  /**
+   * Start a server ahead of the agents it serves, for the project holding `file`;
+   * a missing file or a failed start is ignored. Returns the server's key when started.
+   */
+  async prewarm(server: ServerConfig, file: string): Promise<string | undefined> {
+    if (this.#closed || !(await access(file).then(() => true, () => false))) return undefined
+    const target = await this.#target(server, file)
+    if (!target) return undefined
+    this.#log(`${target.key} prewarming`)
+    void this.#client(target).catch(() => undefined)
+    return target.key
   }
 
   /** Run one document operation per file at a time, so versions reach servers in order. */

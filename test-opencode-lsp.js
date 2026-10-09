@@ -953,6 +953,33 @@ test("an idle server is stopped and starts again on next use", async () => {
   }
 })
 
+test("a prewarm server starts in the background when a listed agent runs any tool, and still serves only its agents", async () => {
+  const log = join(tmpdir(), `lsp-prewarm-${process.pid}.log`)
+  const root = await project({
+    fake: { command: ["FAKE"], extensions: [".ts"], agents: ["implementer"], prewarm: { agents: ["architect"], file: "f.ts" }, env: { FAKE_LOG: log } },
+  })
+  const { after, lsp, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "f.ts"), "ERROR\n")
+    await after({ ...completed("read", { path: "other.md" }, { content: "" }), agent: "reviewer" })
+    await sleep(200)
+    assert.equal(await initializeCount(log), 0, "an unlisted agent prewarmed the server")
+    await after({ ...completed("read", { path: "other.md" }, { content: "" }), agent: "architect" })
+    await after({ ...completed("read", { path: "other.md" }, { content: "" }), agent: "architect" })
+    await sleep(300)
+    assert.equal(await initializeCount(log), 1, "the server was not prewarmed exactly once")
+    await assert.rejects(lsp.execute({ operation: "hover", path: "f.ts", line: 1, character: 1 }, { agent: "architect" }), /No LSP server available/)
+    const edit = { ...completed("edit", { path: "f.ts" }, { content: "Edited f.ts" }), agent: "implementer" }
+    await after(edit)
+    assert.match(JSON.stringify(edit.result.content), /LSP errors detected in this file/)
+    assert.equal(await initializeCount(log), 1, "the implementer did not reuse the prewarmed server")
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+    await rm(log, { force: true })
+  }
+})
+
 test("settings follow OpenCode 2's config precedence and deep merge, then plugin options", async () => {
   const root = await mkdtemp(join(tmpdir(), "opencode-lsp-config-"))
   try {
