@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url"
 import type { Diagnostic } from "./client.ts"
 import { isRecord, type ServerConfig } from "./config.ts"
 import { diagnosticsReport, displayPath, errorsOnly } from "./format.ts"
-import { insideProject, type LspManager } from "./manager.ts"
+import { insideProject, within, type LspManager } from "./manager.ts"
 
 const MUTATING_TOOLS = new Set(["write", "edit", "patch", "apply_patch"])
 const MAX_OTHER_FILES = 5
@@ -27,7 +27,7 @@ export function afterTool(manager: LspManager, root: string, diagnostics: boolea
   const warmed = new Set<string>()
   return async (event: { tool: string; status: string; input: unknown; agent?: string }) => {
     for (const server of servers) {
-      if (!server.prewarm || warmed.has(server.id) || !event.agent || !server.prewarm.agents.includes(event.agent)) continue
+      if (!server.prewarm || startsOnLoad(server, root) || warmed.has(server.id) || !event.agent || !server.prewarm.agents.includes(event.agent)) continue
       warmed.add(server.id)
       void manager.prewarm(server, absolute(root, server.prewarm.file))
     }
@@ -150,7 +150,13 @@ function append(result: Completed["result"], text: string): void {
   else result.content = text.trimStart()
 }
 
-function absolute(root: string, value: string): string {
+/** Whether the server is prewarmed when the plugin loads for this project, instead of on an agent's first tool. */
+export function startsOnLoad(server: ServerConfig, root: string): boolean {
+  const roots = server.prewarm?.onStart
+  return roots === true || (roots !== undefined && roots.some((prefix) => within(prefix, root)))
+}
+
+export function absolute(root: string, value: string): string {
   const path = value.replace(/^@/, "")
   return isAbsolute(path) ? resolve(path) : resolve(root, path)
 }

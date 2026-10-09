@@ -5,7 +5,7 @@
 // The default export is the plain `{ id, setup }` shape OpenCode 2 loads, so
 // the plugin needs no `@opencode/plugin` install.
 import { resolveSettings } from "./src/config.ts"
-import { afterTool } from "./src/diagnostics.ts"
+import { absolute, afterTool, startsOnLoad } from "./src/diagnostics.ts"
 import { LspManager } from "./src/manager.ts"
 import { lspTool } from "./src/tool.ts"
 
@@ -20,6 +20,9 @@ export default {
     const manager = new LspManager(settings, root)
     const tools = await ctx.tool.transform((editor: any) => editor.add(lspTool(manager, root)))
     const hook = await ctx.tool.hook("execute.after", afterTool(manager, root, settings.diagnostics, settings.servers))
+    for (const server of settings.servers) {
+      if (server.prewarm && startsOnLoad(server, root)) void manager.prewarm(server, absolute(root, server.prewarm.file))
+    }
     return async () => {
       await hook.dispose()
       await tools.dispose()

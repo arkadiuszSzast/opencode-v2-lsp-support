@@ -1,4 +1,4 @@
-import { access, open, readFile, realpath, stat } from "node:fs/promises"
+import { access, mkdir, open, readFile, realpath, rename, stat, writeFile } from "node:fs/promises"
 import { basename, dirname, extname, isAbsolute, join, relative, sep } from "node:path"
 import { pathToFileURL } from "node:url"
 import { setTimeout as delay } from "node:timers/promises"
@@ -121,6 +121,13 @@ async function cargoWorkspace(crate: string, project: string): Promise<string> {
   }
 }
 
+export type ServerState = "starting" | "indexing" | "ready" | "broken" | "stopped"
+
+/** The state file for a project: its absolute path with every other character than `A-Za-z0-9._-` turned into `-`. */
+export function statusFile(dir: string, root: string): string {
+  return join(dir, `${root.replace(/[^A-Za-z0-9._-]/g, "-")}.json`)
+}
+
 export class LspManager {
   readonly #settings: Settings
   readonly #root: string
@@ -131,6 +138,9 @@ export class LspManager {
   readonly #listeners = new Map<string, Set<() => void>>()
   readonly #queues = new Map<string, Promise<void>>()
   readonly #reaper?: ReturnType<typeof setInterval>
+  readonly #states = new Map<string, { state: ServerState; since: number; detail?: string }>()
+  #statusWrite?: Promise<void>
+  #statusDirty = false
   #closed = false
 
   constructor(settings: Settings, root: string) {
@@ -445,8 +455,10 @@ export class LspManager {
       requestTimeoutMs: this.#settings.requestTimeoutMs,
       onDiagnostics: (uri, diagnostics, version) => this.#store(key, uri, diagnostics, version),
       onActivity: () => this.#notify(key),
+      onProgress: () => this.#status(key),
       onExit: () => {
         if (current.client === client) current.client = undefined
+        this.#status(key)
       },
       debug: this.#settings.debug,
     })
@@ -466,7 +478,9 @@ export class LspManager {
       })
       .finally(() => {
         current.starting = undefined
+        this.#status(key)
       })
+    this.#status(key)
     return current.starting
   }
 
@@ -485,6 +499,47 @@ export class LspManager {
     for (const listener of [...(this.#listeners.get(serverID) ?? [])]) listener()
   }
 
+  /**
+   * Record a server's state in `statusDir`, so a pipeline step can wait for a slow
+   * import before agents start. Writes are coalesced and replace the file atomically.
+   */
+  #status(key: string): void {
+    if (!this.#settings.statusDir) return
+    const entry = this.#entries.get(key)
+    const state: ServerState = entry?.broken
+      ? "broken"
+      : entry?.starting
+        ? "starting"
+        : entry?.client?.running
+          ? entry.client.busy
+            ? "indexing"
+            : "ready"
+          : "stopped"
+    const previous = this.#states.get(key)
+    if (previous?.state === state) return
+    this.#states.set(key, { state, since: Date.now(), detail: entry?.broken })
+    this.#statusDirty = true
+    this.#statusWrite ??= this.#flushStatus().finally(() => {
+      this.#statusWrite = undefined
+    })
+  }
+
+  async #flushStatus(): Promise<void> {
+    const dir = this.#settings.statusDir!
+    const file = statusFile(dir, this.#root)
+    while (this.#statusDirty) {
+      this.#statusDirty = false
+      const body = JSON.stringify({ root: this.#root, pid: process.pid, updatedAt: Date.now(), servers: Object.fromEntries(this.#states) }, null, 2)
+      try {
+        await mkdir(dir, { recursive: true })
+        await writeFile(`${file}.${process.pid}.tmp`, body + "\n")
+        await rename(`${file}.${process.pid}.tmp`, file)
+      } catch (error) {
+        this.#log(`cannot write status ${file}: ${errorMessage(error)}`)
+      }
+    }
+  }
+
   #log(message: string): void {
     if (this.#settings.debug) console.error(`[lsp] ${message}`)
   }
@@ -498,12 +553,14 @@ export class LspManager {
       this.#published.delete(key)
       this.#log(`${key} idle, stopping`)
       await entry.client.stop()
+      this.#status(key)
     }
   }
 
   async shutdown(): Promise<void> {
     if (this.#reaper) clearInterval(this.#reaper)
     this.#closed = true
+    await this.#statusWrite
     const entries = [...this.#entries.values()]
     this.#entries.clear()
     await Promise.all(
@@ -512,6 +569,10 @@ export class LspManager {
         await client?.stop()
       }),
     )
+    if (!this.#settings.statusDir || this.#states.size === 0) return
+    for (const key of this.#states.keys()) this.#states.set(key, { state: "stopped", since: Date.now() })
+    this.#statusDirty = true
+    await (this.#statusWrite ?? this.#flushStatus())
   }
 }
 

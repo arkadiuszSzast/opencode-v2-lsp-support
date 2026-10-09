@@ -13,8 +13,11 @@ export interface ServerConfig {
   readonly initialization?: Record<string, unknown>
   /** Agents allowed to use this server; undefined allows every agent. */
   readonly agents?: string[]
-  /** Start the server in the background once any of these agents runs a tool, for the project holding `file`. */
-  readonly prewarm?: { readonly agents: string[]; readonly file: string }
+  /**
+   * Start the server in the background for the project holding `file` once any of `agents`
+   * runs a tool, or when the plugin loads for a project under one of `onStart` (`true`: any).
+   */
+  readonly prewarm?: { readonly agents: string[]; readonly file: string; readonly onStart?: true | string[] }
 }
 
 export interface Settings {
@@ -27,6 +30,8 @@ export interface Settings {
   readonly startWaitMs: number
   /** Stop a server unused this long; 0 keeps servers until shutdown. */
   readonly idleTimeoutMs: number
+  /** Directory for per-project server state files, so scripts can wait for an import to finish. */
+  readonly statusDir?: string
   readonly debug: boolean
 }
 
@@ -52,6 +57,7 @@ export function resolveSettings(directory: string, options: Record<string, unkno
     requestTimeoutMs: positive(options.requestTimeoutMs, 15_000),
     startWaitMs: positive(options.startWaitMs, 10_000),
     idleTimeoutMs: positive(options.idleTimeoutMs, 0),
+    statusDir: typeof options.statusDir === "string" && options.statusDir !== "" ? resolve(options.statusDir) : undefined,
     debug,
   }
 }
@@ -169,8 +175,8 @@ function resolveServers(lsp: unknown, debug: boolean): ServerConfig[] {
       initialization: isRecord(entry.initialization) ? entry.initialization : undefined,
       agents: Array.isArray(entry.agents) ? strings(entry.agents) : undefined,
       prewarm:
-        isRecord(entry.prewarm) && typeof entry.prewarm.file === "string" && strings(entry.prewarm.agents).length > 0
-          ? { agents: strings(entry.prewarm.agents), file: entry.prewarm.file }
+        isRecord(entry.prewarm) && typeof entry.prewarm.file === "string" && (onStart(entry.prewarm.onStart) || strings(entry.prewarm.agents).length > 0)
+          ? { agents: strings(entry.prewarm.agents), file: entry.prewarm.file, onStart: onStart(entry.prewarm.onStart) }
           : undefined,
     })
   }
@@ -187,6 +193,12 @@ function canonical(path: string): string {
 
 function truthy(value: string | undefined): boolean {
   return value === "1" || value?.toLowerCase() === "true"
+}
+
+function onStart(value: unknown): true | string[] | undefined {
+  if (value === true) return true
+  const roots = strings(value).map((root) => resolve(root.startsWith("~/") ? join(homedir(), root.slice(2)) : root))
+  return roots.length ? roots : undefined
 }
 
 function strings(value: unknown): string[] {

@@ -980,6 +980,84 @@ test("a prewarm server starts in the background when a listed agent runs any too
   }
 })
 
+test("an onStart prewarm starts its server when the plugin loads and records starting, indexing, ready, and stopped", async () => {
+  const log = join(tmpdir(), `lsp-onstart-${process.pid}.log`)
+  const statusDir = join(tmpdir(), `lsp-status-${process.pid}`)
+  const root = await project({
+    fake: { command: ["FAKE"], extensions: [".ts"], agents: ["implementer"], prewarm: { onStart: true, file: "f.ts" }, env: { FAKE_LOG: log, FAKE_INIT_DELAY: "200", FAKE_PROGRESS: "400" } },
+  })
+  await writeFile(join(root, "f.ts"), "clean\n")
+  const file = join(statusDir, `${root.replace(/[^A-Za-z0-9._-]/g, "-")}.json`)
+  const state = async () => JSON.parse(await readFile(file, "utf8").catch(() => "{}")).servers?.fake?.state
+  const seen = new Set()
+  const { cleanup } = await start(root, { statusDir })
+  try {
+    for (const deadline = Date.now() + 5_000; Date.now() < deadline && (await state()) !== "ready"; await sleep(20)) seen.add(await state())
+    assert.equal(await state(), "ready", "the server never became ready")
+    assert.ok(seen.has("indexing"), `indexing was not recorded: ${[...seen]}`)
+    assert.equal(await initializeCount(log), 1, "the server was not started once on load")
+    assert.equal(JSON.parse(await readFile(file, "utf8")).root, root)
+  } finally {
+    await cleanup()
+    assert.equal(await state(), "stopped", "shutdown did not record the server as stopped")
+    await rm(root, { recursive: true, force: true })
+    await rm(statusDir, { recursive: true, force: true })
+    await rm(log, { force: true })
+  }
+})
+
+test("onStart roots limit load-time prewarm to projects under them; elsewhere listed agents still prewarm", async () => {
+  const log = join(tmpdir(), `lsp-roots-${process.pid}.log`)
+  const root = await project({
+    fake: { command: ["FAKE"], extensions: [".ts"], prewarm: { onStart: ["/nonexistent-root"], agents: ["architect"], file: "f.ts" }, env: { FAKE_LOG: log } },
+  })
+  await writeFile(join(root, "f.ts"), "clean\n")
+  const { after, cleanup } = await start(root)
+  try {
+    await sleep(200)
+    assert.equal(await initializeCount(log), 0, "a server outside its onStart roots started on load")
+    await after({ ...completed("read", { path: "other.md" }, { content: "" }), agent: "architect" })
+    await sleep(300)
+    assert.equal(await initializeCount(log), 1, "a listed agent did not prewarm the server")
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+    await rm(log, { force: true })
+  }
+  const inside = await project({ fake: { command: ["FAKE"], extensions: [".ts"], prewarm: { onStart: [tmpdir()], file: "f.ts" }, env: { FAKE_LOG: log } } })
+  await writeFile(join(inside, "f.ts"), "clean\n")
+  const loaded = await start(inside)
+  try {
+    for (const deadline = Date.now() + 5_000; Date.now() < deadline && (await initializeCount(log)) === 0; ) await sleep(20)
+    assert.equal(await initializeCount(log), 1, "a server under its onStart root did not start on load")
+  } finally {
+    await loaded.cleanup()
+    await rm(inside, { recursive: true, force: true })
+    await rm(log, { force: true })
+  }
+})
+
+test("a server that cannot start is recorded as broken", async () => {
+  const statusDir = join(tmpdir(), `lsp-broken-${process.pid}`)
+  const root = await project({ missing: { command: ["/nonexistent/lsp-binary"], extensions: [".ts"], prewarm: { onStart: true, file: "f.ts" } } })
+  await writeFile(join(root, "f.ts"), "clean\n")
+  const file = join(statusDir, `${root.replace(/[^A-Za-z0-9._-]/g, "-")}.json`)
+  const { cleanup } = await start(root, { statusDir })
+  try {
+    let status
+    for (const deadline = Date.now() + 5_000; Date.now() < deadline; await sleep(20)) {
+      status = JSON.parse(await readFile(file, "utf8").catch(() => "{}")).servers?.missing
+      if (status?.state === "broken") break
+    }
+    assert.equal(status?.state, "broken")
+    assert.match(status.detail, /cannot start/)
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+    await rm(statusDir, { recursive: true, force: true })
+  }
+})
+
 test("settings follow OpenCode 2's config precedence and deep merge, then plugin options", async () => {
   const root = await mkdtemp(join(tmpdir(), "opencode-lsp-config-"))
   try {

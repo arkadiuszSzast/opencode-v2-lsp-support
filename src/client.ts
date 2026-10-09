@@ -49,6 +49,8 @@ export interface ClientOptions {
   /** Called for every message from the server. Diagnostics waits use it to tell when the server is busy. */
   readonly onActivity: () => void
   readonly onExit: () => void
+  /** Called when work-done progress opens or closes. */
+  readonly onProgress?: () => void
   readonly debug: boolean
 }
 
@@ -270,6 +272,8 @@ export class LspClient {
       if (typeof token !== "string" && typeof token !== "number") return
       if (kind === "begin") this.#progress.set(token, Date.now())
       else if (kind === "end") this.#progress.delete(token)
+      else return
+      this.#options.onProgress?.()
       return
     }
     if (message.id !== undefined) this.#respond(message.id, message.method, message.params)
