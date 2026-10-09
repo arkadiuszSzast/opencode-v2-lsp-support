@@ -29,6 +29,7 @@ interface Entry {
   starting?: Promise<LspClient>
   broken?: string
   warmed?: boolean
+  lastUsed: number
   readonly opened: Set<string>
 }
 
@@ -50,6 +51,8 @@ export interface FileDiagnostics {
   readonly file?: Diagnostic[]
   /** Other files whose diagnostics a server published while this file was checked. */
   readonly others: Map<string, Diagnostic[]>
+  /** Servers for the file that are still starting or indexing, so their report is missing or may be incomplete. */
+  readonly pending: string[]
 }
 
 /** A file's extension, or `.name` for an extensionless file such as `Dockerfile`. */
@@ -127,24 +130,42 @@ export class LspManager {
   readonly #published = new Map<string, Map<string, Published>>()
   readonly #listeners = new Map<string, Set<() => void>>()
   readonly #queues = new Map<string, Promise<void>>()
+  readonly #reaper?: ReturnType<typeof setInterval>
   #closed = false
 
   constructor(settings: Settings, root: string) {
     this.#settings = settings
     this.#root = root
+    if (settings.idleTimeoutMs > 0) {
+      this.#reaper = setInterval(() => void this.#reap(), Math.min(60_000, Math.max(1_000, settings.idleTimeoutMs / 4)))
+      this.#reaper.unref?.()
+    }
   }
 
-  serversFor(file: string): ServerConfig[] {
+  /** Servers for the file that the agent may use. Servers listing `agents` serve only those agents. */
+  serversFor(file: string, agent?: string): ServerConfig[] {
     const key = extensionKey(file)
     const name = basename(file).toLowerCase()
-    return this.#settings.servers.filter((server) =>
-      server.extensions.some((extension) => [key, name].includes(extension.toLowerCase())),
+    return this.#settings.servers.filter(
+      (server) =>
+        server.extensions.some((extension) => [key, name].includes(extension.toLowerCase())) &&
+        (server.agents === undefined || (agent !== undefined && server.agents.includes(agent))),
     )
   }
 
-  async #targets(file: string): Promise<Target[]> {
+  /** Servers for the file that are running but still importing or indexing the project. */
+  async busyServers(file: string, agent?: string): Promise<string[]> {
+    const busy: string[] = []
+    for (const target of await this.#targets(file, agent)) {
+      const entry = this.#entries.get(target.key)
+      if (entry?.starting || entry?.client?.busy) busy.push(target.key)
+    }
+    return busy
+  }
+
+  async #targets(file: string, agent?: string): Promise<Target[]> {
     const targets: Target[] = []
-    for (const server of this.serversFor(file)) {
+    for (const server of this.serversFor(file, agent)) {
       const root = await serverRoot(server.id, file, this.#root)
       if (!root) continue
       const key = root === this.#root ? server.id : `${server.id} (${relative(this.#root, root)})`
@@ -168,10 +189,10 @@ export class LspManager {
   }
 
   /** Start any missing servers for the file and send them its current contents. */
-  async sync(file: string, signal?: AbortSignal): Promise<Synced[]> {
+  async sync(file: string, signal?: AbortSignal, agent?: string, pending?: string[]): Promise<Synced[]> {
     signal?.throwIfAborted()
     const uri = pathToFileURL(file).href
-    return abortable(this.#serialize(uri, () => this.#sync(file, uri, signal)), signal)
+    return abortable(this.#serialize(uri, () => this.#sync(file, uri, signal, agent, pending)), signal)
   }
 
   /**
@@ -192,16 +213,25 @@ export class LspManager {
     })
   }
 
-  async #sync(file: string, uri: string, signal?: AbortSignal): Promise<Synced[]> {
+  /**
+   * With `pending`, a server still starting after `startWaitMs` is skipped and named
+   * there instead of holding up the edit; it keeps starting in the background.
+   */
+  async #sync(file: string, uri: string, signal?: AbortSignal, agent?: string, pending?: string[]): Promise<Synced[]> {
     signal?.throwIfAborted()
     // OpenCode 1 asked before touching files outside the project; plugins cannot ask, so they are never sent.
     const text = await readInside(this.#root, file)
     signal?.throwIfAborted()
     const ready: { target: Target; client: LspClient }[] = []
-    for (const target of await this.#targets(file)) {
+    for (const target of await this.#targets(file, agent)) {
       signal?.throwIfAborted()
       // Initialization is shared; cancelling one tool must not break another caller's server.
-      const client = await abortable(this.#client(target).catch(() => undefined), signal)
+      const starting = this.#client(target).catch(() => undefined)
+      const client = await abortable(pending ? withinMs(starting, this.#settings.startWaitMs) : starting, signal)
+      if (client === STILL_STARTING) {
+        pending!.push(target.key)
+        continue
+      }
       signal?.throwIfAborted()
       if (client) ready.push({ target, client })
     }
@@ -216,6 +246,7 @@ export class LspManager {
     const synced: Synced[] = []
     for (const { target, client } of ready) {
       const entry = this.#entries.get(target.key)!
+      entry.lastUsed = Date.now()
       const sentAt = Date.now()
       if (entry.opened.has(uri)) {
         client.notify("textDocument/didChange", { textDocument: { uri, version }, contentChanges: [{ text }] })
@@ -236,10 +267,11 @@ export class LspManager {
   }
 
   /** Sync the file and wait for its diagnostics. */
-  async diagnostics(file: string, timeoutMs = this.#settings.diagnosticsTimeoutMs, signal?: AbortSignal): Promise<FileDiagnostics> {
+  async diagnostics(file: string, timeoutMs = this.#settings.diagnosticsTimeoutMs, signal?: AbortSignal, agent?: string): Promise<FileDiagnostics> {
     signal?.throwIfAborted()
     const uri = pathToFileURL(file).href
-    const synced = await this.sync(file, signal).catch((error) => {
+    const pending: string[] = []
+    const synced = await this.sync(file, signal, agent, pending).catch((error) => {
       signal?.throwIfAborted()
       this.#log(`${file}: ${errorMessage(error)}`)
       return []
@@ -255,7 +287,8 @@ export class LspManager {
         others.set(other, [...(others.get(other) ?? []), ...published.diagnostics])
       }
     }
-    return { file: reported.length ? reported.flat() : undefined, others }
+    for (const { client } of synced) if (client.busy && !pending.includes(client.id)) pending.push(client.id)
+    return { file: reported.length ? reported.flat() : undefined, others, pending }
   }
 
   async #collect(client: LspClient, uri: string, version: number, since: number, timeoutMs: number, signal?: AbortSignal): Promise<Diagnostic[] | undefined> {
@@ -339,14 +372,14 @@ export class LspManager {
    * Run `send` against every server for the file that has the capability, and
    * concatenate their results. Throws when none can answer.
    */
-  async request(file: string, capability: string, send: (client: LspClient) => Promise<unknown>, signal?: AbortSignal): Promise<unknown[]> {
+  async request(file: string, capability: string, send: (client: LspClient) => Promise<unknown>, signal?: AbortSignal, agent?: string): Promise<unknown[]> {
     signal?.throwIfAborted()
-    if (this.serversFor(file).length === 0) throw new Error("No LSP server available for this file type.")
-    const targets = await abortable(this.#targets(file), signal)
+    if (this.serversFor(file, agent).length === 0) throw new Error("No LSP server available for this file type.")
+    const targets = await abortable(this.#targets(file, agent), signal)
     if (targets.length === 0) throw new Error("No configured LSP server applies to this file's project.")
     const cold = targets.some((target) => !this.#entries.get(target.key)?.warmed)
-    if (cold) await this.diagnostics(file, WARMUP_TIMEOUT_MS, signal)
-    else await this.sync(file, signal)
+    if (cold) await this.diagnostics(file, WARMUP_TIMEOUT_MS, signal, agent)
+    else await this.sync(file, signal, agent)
     signal?.throwIfAborted()
     const clients: LspClient[] = []
     for (const target of targets) {
@@ -356,7 +389,10 @@ export class LspManager {
       clients.push(entry.client)
     }
     if (clients.length === 0) {
-      const reasons = targets.map((target) => `${target.key}: ${this.#entries.get(target.key)?.broken ?? "not running"}`)
+      const reasons = targets.map((target) => {
+        const entry = this.#entries.get(target.key)
+        return `${target.key}: ${entry?.broken ?? (entry?.starting ? "still starting, try again shortly" : "not running")}`
+      })
       throw new Error(`No LSP server for this file could start. ${reasons.join("; ")}`)
     }
     const capable = clients.filter((client) => client.capabilities[capability])
@@ -369,9 +405,10 @@ export class LspManager {
     if (this.#closed) throw new Error("LSP is shut down")
     let entry = this.#entries.get(key)
     if (!entry) {
-      entry = { opened: new Set() }
+      entry = { opened: new Set(), lastUsed: Date.now() }
       this.#entries.set(key, entry)
     }
+    entry.lastUsed = Date.now()
     if (entry.broken) throw new Error(entry.broken)
     if (entry.client?.running) return entry.client
     if (entry.starting) return entry.starting
@@ -434,7 +471,20 @@ export class LspManager {
     if (this.#settings.debug) console.error(`[lsp] ${message}`)
   }
 
+  /** Stop servers nobody has used for `idleTimeoutMs`; the next use starts them again. */
+  async #reap(): Promise<void> {
+    const cutoff = Date.now() - this.#settings.idleTimeoutMs
+    for (const [key, entry] of this.#entries) {
+      if (entry.starting || !entry.client || entry.lastUsed > cutoff) continue
+      this.#entries.delete(key)
+      this.#published.delete(key)
+      this.#log(`${key} idle, stopping`)
+      await entry.client.stop()
+    }
+  }
+
   async shutdown(): Promise<void> {
+    if (this.#reaper) clearInterval(this.#reaper)
     this.#closed = true
     const entries = [...this.#entries.values()]
     this.#entries.clear()
@@ -445,6 +495,16 @@ export class LspManager {
       }),
     )
   }
+}
+
+const STILL_STARTING = Symbol("still starting")
+
+function withinMs<T>(promise: Promise<T>, ms: number): Promise<T | typeof STILL_STARTING> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const late = new Promise<typeof STILL_STARTING>((resolve) => {
+    timer = setTimeout(() => resolve(STILL_STARTING), ms)
+  })
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer))
 }
 
 /** Send a request, retrying while the server reports it is still loading. */

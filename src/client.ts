@@ -18,6 +18,8 @@ export interface Diagnostic {
   readonly message: string
 }
 
+const STALE_PROGRESS_MS = 30 * 60_000
+
 interface Pending {
   resolve: (value: any) => void
   reject: (error: Error) => void
@@ -60,6 +62,7 @@ export class LspClient {
   #pending = new Map<number, Pending>()
   #capabilities: Record<string, any> = {}
   #stopping = false
+  readonly #progress = new Map<string | number, number>()
 
   constructor(options: ClientOptions) {
     this.id = options.id
@@ -68,6 +71,20 @@ export class LspClient {
 
   get capabilities(): Record<string, any> {
     return this.#capabilities
+  }
+
+  /**
+   * Whether the server has work-done progress open, such as a project import or
+   * indexing. Its diagnostics and navigation results may be incomplete meanwhile.
+   */
+  get busy(): boolean {
+    // A token a server never ends must not mark it busy for good.
+    const since = Date.now() - STALE_PROGRESS_MS
+    for (const [token, began] of this.#progress) {
+      if (began >= since) return true
+      this.#progress.delete(token)
+    }
+    return false
   }
 
   get running(): boolean {
@@ -247,6 +264,14 @@ export class LspClient {
       )
       return
     }
+    if (message.method === "$/progress") {
+      const token = message.params?.token
+      const kind = message.params?.value?.kind
+      if (typeof token !== "string" && typeof token !== "number") return
+      if (kind === "begin") this.#progress.set(token, Date.now())
+      else if (kind === "end") this.#progress.delete(token)
+      return
+    }
     if (message.id !== undefined) this.#respond(message.id, message.method, message.params)
   }
 
@@ -286,6 +311,7 @@ export class LspClient {
 
   #onExit(code: number | null, signal: NodeJS.Signals | null): void {
     this.#child = undefined
+    this.#progress.clear()
     this.#rejectPending(new Error(`${this.id}: server exited (${code ?? signal})`))
     if (!this.#stopping && this.#options.debug) console.error(`[lsp:${this.id}] exited (${code ?? signal})`)
     this.#options.onExit()

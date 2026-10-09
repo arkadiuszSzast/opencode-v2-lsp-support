@@ -13,6 +13,7 @@ interface Completed {
   readonly tool: string
   readonly input: unknown
   readonly status: "completed"
+  readonly agent?: string
   result: { output?: unknown; content?: unknown; metadata?: Record<string, unknown> }
 }
 
@@ -23,9 +24,9 @@ interface Completed {
  * and moved-away files are closed so servers stop analyzing their old contents.
  */
 export function afterTool(manager: LspManager, root: string, diagnostics: boolean) {
-  return async (event: { tool: string; status: string; input: unknown }) => {
+  return async (event: { tool: string; status: string; input: unknown; agent?: string }) => {
     if (event.status !== "completed") return
-    if (event.tool === "read") return warm(manager, root, event.input)
+    if (event.tool === "read") return warm(manager, root, event.input, event.agent)
     if (!MUTATING_TOOLS.has(event.tool)) return
     const { changed, deleted } = touchedFiles(event as Completed, root)
     await Promise.all(deleted.map((file) => manager.close(file)))
@@ -34,29 +35,31 @@ export function afterTool(manager: LspManager, root: string, diagnostics: boolea
 }
 
 /** Files with a server that resolve inside the project. OpenCode 1 asked before touching others; plugins cannot ask. */
-async function checkable(manager: LspManager, root: string, files: string[]): Promise<string[]> {
-  const inside = await Promise.all(files.map((file) => manager.serversFor(file).length > 0 && insideProject(root, file)))
+async function checkable(manager: LspManager, root: string, files: string[], agent?: string): Promise<string[]> {
+  const inside = await Promise.all(files.map((file) => manager.serversFor(file, agent).length > 0 && insideProject(root, file)))
   return files.filter((_, index) => inside[index])
 }
 
-function warm(manager: LspManager, root: string, input: unknown): void {
+function warm(manager: LspManager, root: string, input: unknown, agent?: string): void {
   if (!isRecord(input) || typeof input.path !== "string") return
   const file = absolute(root, input.path)
-  void checkable(manager, root, [file])
-    .then(async ([inside]) => (inside && (await stat(inside)).isFile() ? manager.sync(inside) : undefined))
+  void checkable(manager, root, [file], agent)
+    .then(async ([inside]) => (inside && (await stat(inside)).isFile() ? manager.sync(inside, undefined, agent) : undefined))
     .catch(() => undefined)
 }
 
 async function report(manager: LspManager, root: string, event: Completed, changed: string[]): Promise<void> {
-  const files = await checkable(manager, root, changed)
+  const files = await checkable(manager, root, changed, event.agent)
   if (files.length === 0) return
 
   const sections: string[] = []
   const shown: Record<string, Diagnostic[]> = {}
   const others = new Map<string, Diagnostic[]>()
-  const results = await Promise.all(files.map((file) => manager.diagnostics(file)))
+  const pending = new Set<string>()
+  const results = await Promise.all(files.map((file) => manager.diagnostics(file, undefined, undefined, event.agent)))
   for (const [index, file] of files.entries()) {
     const result = results[index]
+    for (const server of result.pending) pending.add(server)
     for (const [uri, diagnostics] of result.others) others.set(uri, diagnostics)
     const errors = errorsOnly(result.file ?? [])
     if (errors.length === 0) continue
@@ -85,6 +88,8 @@ async function report(manager: LspManager, root: string, event: Completed, chang
     if (block) elsewhere.push(block)
   }
   if (elsewhere.length) sections.push(`LSP errors detected in other files:\n${elsewhere.join("\n")}`)
+  // Silence from a server that is still importing or indexing is not a clean result.
+  if (pending.size) sections.push(pendingNotice([...pending]))
   if (sections.length === 0) return
 
   // OpenCode's terminal UI shows `metadata.diagnostics[input.path]` under the edit.
@@ -94,6 +99,10 @@ async function report(manager: LspManager, root: string, event: Completed, chang
     diagnostics: { ...(isRecord(existing) ? existing : {}), ...shown },
   }
   append(event.result, `\n\n${sections.join("\n\n")}`)
+}
+
+export function pendingNotice(servers: string[]): string {
+  return `LSP still indexing (${servers.join(", ")}): diagnostics for this change may be missing or incomplete. Do not read their absence as a clean build; edit again later or compile to confirm.`
 }
 
 /** Files the tool created or changed, and files it deleted, as absolute paths. */

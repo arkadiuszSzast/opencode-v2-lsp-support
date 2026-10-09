@@ -72,28 +72,32 @@ export function lspTool(manager: LspManager, root: string) {
       additionalProperties: false,
     },
     options: { codemode: false, permission: "lsp" },
-    async execute(input: Input, context: { signal?: AbortSignal } = {}) {
-      const { signal } = context
+    async execute(input: Input, context: { signal?: AbortSignal; agent?: string } = {}) {
+      const { signal, agent } = context
       signal?.throwIfAborted()
       const file = await resolveFile(root, input.path)
       signal?.throwIfAborted()
-      const content = await run(manager, root, file, input, signal)
+      const content = await run(manager, root, file, input, signal, agent)
+      const busy = await manager.busyServers(file, agent)
+      const notice = busy.length
+        ? `\n\n(LSP still indexing: ${busy.join(", ")}; results may be incomplete, retry later if something looks missing.)`
+        : ""
       return {
-        content: content || `No results found for ${input.operation}`,
+        content: (content || `No results found for ${input.operation}`) + notice,
         metadata: { operation: input.operation, path: displayPath(file, root) },
       }
     },
   }
 }
 
-async function run(manager: LspManager, root: string, file: string, input: Input, signal?: AbortSignal): Promise<string> {
+async function run(manager: LspManager, root: string, file: string, input: Input, signal?: AbortSignal, agent?: string): Promise<string> {
   const textDocument = { uri: pathToFileURL(file).href }
   const position = () => {
     if (!input.line || !input.character) throw new Error(`${input.operation} needs line and character.`)
     return { line: input.line - 1, character: input.character - 1 }
   }
   const ask = (capability: string, method: string, params: Record<string, unknown>) =>
-    manager.request(file, capability, (client) => requestWithRetry(client, method, params, signal), signal)
+    manager.request(file, capability, (client) => requestWithRetry(client, method, params, signal), signal, agent)
   const list = (lines: string[]) => lines.join("\n")
 
   switch (input.operation) {
@@ -136,7 +140,7 @@ async function run(manager: LspManager, root: string, file: string, input: Input
           const caller = typeof item?.uri === "string" && item.uri.startsWith("file:") ? fileURLToPath(item.uri) : file
           return Array.isArray(result) ? result.flatMap((call) => formatCall(call, incoming, caller, root) ?? []) : []
         })
-      }, signal)
+      }, signal, agent)
       return list(lines as string[])
     }
     default:

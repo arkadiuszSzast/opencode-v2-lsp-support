@@ -61,7 +61,7 @@ The supported operation names are `goToDefinition`, `findReferences`, `hover`, `
 
 ## Configuration
 
-The plugin reads the V1-shaped `lsp` map from OpenCode config files. Each server takes `command` (executable and arguments), optional `extensions`, `env`, `initialization`, and `disabled`. `initialization` supplies initialization options, configuration-change settings, and answers to `workspace/configuration` requests.
+The plugin reads the V1-shaped `lsp` map from OpenCode config files. Each server takes `command` (executable and arguments), optional `extensions`, `env`, `initialization`, `agents`, and `disabled`. `agents` lists the OpenCode agents the server serves (for example only the agents that write code, to keep a heavy server off reviewers); without it every agent is served. `initialization` supplies initialization options, configuration-change settings, and answers to `workspace/configuration` requests.
 
 Known V1 server IDs have default extensions and root rules in [src/catalog.ts](src/catalog.ts). For example, `pyright` selects the nearest Python project marker, `typescript` selects the nearest JavaScript lockfile and skips Deno projects, and `rust` detects Cargo workspaces. Custom IDs must supply extensions and run at the plugin's project directory. Recognizing an ID does **not** supply an executable command: every enabled server must have one configured.
 
@@ -79,6 +79,8 @@ Optional settings use OpenCode's object-form plugin entry:
         "diagnosticsTimeoutMs": 5000,
         "initializeTimeoutMs": 45000,
         "requestTimeoutMs": 15000,
+        "startWaitMs": 10000,
+        "idleTimeoutMs": 0,
         "debug": false
       }
     }
@@ -86,7 +88,7 @@ Optional settings use OpenCode's object-form plugin entry:
 }
 ```
 
-The values shown are the defaults. `diagnostics: false` disables post-edit reporting but leaves navigation available. `options.lsp` overrides server settings; `lsp: false` disables all servers. Without any enabled, configured servers, the plugin registers neither the tool nor the diagnostic hook. Reload the plugin after changing its settings.
+The values shown are the defaults. `startWaitMs` caps how long an edit waits for a server that is still starting; past it the edit returns at once with a notice and the server keeps starting in the background. `idleTimeoutMs` stops a server nobody has used for that long (0 keeps servers until the plugin unloads); the next use starts it again. `diagnostics: false` disables post-edit reporting but leaves navigation available. `options.lsp` overrides server settings; `lsp: false` disables all servers. Without any enabled, configured servers, the plugin registers neither the tool nor the diagnostic hook. Reload the plugin after changing its settings.
 
 ## Limitations and trust
 
@@ -94,7 +96,7 @@ The values shown are the defaults. `diagnostics: false` disables post-edit repor
 - Language servers must already be installed and support stdio. No automatic installation, TCP transport, or full editor functionality is provided.
 - Only errors are appended to tool results; warnings and hints are omitted. Missing diagnostic severity is treated as an error. Reports are capped at 20 errors per file and five other files; workspace symbol results are capped at 20.
 - Diagnostics are best-effort. A silent or failed server leaves the edit result unchanged; a navigation request explains a startup failure. A server that fails to start stays disabled for that plugin instance until it reloads.
-- Cold-start initialization and navigation warm-up can take longer than the configured diagnostics wait.
+- Cold-start initialization and navigation warm-up can take longer than the configured diagnostics wait. While a server is still starting, or reports open work-done progress (such as a Gradle import or indexing), edit results and `lsp` results carry an "LSP still indexing" notice, so an absence of errors is not mistaken for a clean build. Large projects need `initializeTimeoutMs` well above the default; JetBrains `kotlin-lsp`, for one, can take minutes to import a multi-module Gradle build.
 - Save notifications require an explicit `textDocumentSync.save` capability. Legacy numeric-only sync capabilities do not receive them; servers that rely on save-only checks must advertise save support.
 - The plugin checks which document contents it sends; it does **not** sandbox the server process or stop a server from scanning dependencies outside the project. Servers run with the OpenCode service's OS privileges and inherited environment. Only load trusted code and configure trusted commands; debug output may include server messages and paths.
 

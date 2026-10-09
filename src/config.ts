@@ -11,6 +11,8 @@ export interface ServerConfig {
   readonly extensions: string[]
   readonly env: Record<string, string>
   readonly initialization?: Record<string, unknown>
+  /** Agents allowed to use this server; undefined allows every agent. */
+  readonly agents?: string[]
 }
 
 export interface Settings {
@@ -19,6 +21,10 @@ export interface Settings {
   readonly diagnosticsTimeoutMs: number
   readonly initializeTimeoutMs: number
   readonly requestTimeoutMs: number
+  /** How long an edit waits for a server that is still starting before reporting it as unavailable. */
+  readonly startWaitMs: number
+  /** Stop a server unused this long; 0 keeps servers until shutdown. */
+  readonly idleTimeoutMs: number
   readonly debug: boolean
 }
 
@@ -42,6 +48,8 @@ export function resolveSettings(directory: string, options: Record<string, unkno
     diagnosticsTimeoutMs: positive(options.diagnosticsTimeoutMs, 5_000),
     initializeTimeoutMs: positive(options.initializeTimeoutMs, 45_000),
     requestTimeoutMs: positive(options.requestTimeoutMs, 15_000),
+    startWaitMs: positive(options.startWaitMs, 10_000),
+    idleTimeoutMs: positive(options.idleTimeoutMs, 0),
     debug,
   }
 }
@@ -157,6 +165,7 @@ function resolveServers(lsp: unknown, debug: boolean): ServerConfig[] {
       extensions,
       env: isRecord(entry.env) ? Object.fromEntries(Object.entries(entry.env).filter((pair): pair is [string, string] => typeof pair[1] === "string")) : {},
       initialization: isRecord(entry.initialization) ? entry.initialization : undefined,
+      agents: Array.isArray(entry.agents) ? strings(entry.agents) : undefined,
     })
   }
   return servers

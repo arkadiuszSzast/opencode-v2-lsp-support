@@ -71,6 +71,13 @@ const handle = (message) => {
         workspaceSymbolProvider: true, callHierarchyProvider: true,
         ...(pull ? { diagnosticProvider: { interFileDependencies: false, workspaceDiagnostics: false } } : {}),
       } }
+      if (process.env.FAKE_PROGRESS) {
+        // An import that runs past initialize, reported as work-done progress.
+        setTimeout(() => {
+          send({ method: "$/progress", params: { token: "import", value: { kind: "begin", title: "Importing" } } })
+          setTimeout(() => send({ method: "$/progress", params: { token: "import", value: { kind: "end" } } }), Number(process.env.FAKE_PROGRESS))
+        }, 0)
+      }
       if (!process.env.FAKE_EARLY) return process.env.FAKE_INIT_DELAY ? setTimeout(() => send({ id, result }), Number(process.env.FAKE_INIT_DELAY)) : send({ id, result })
       // An unversioned report from before the file was sent, then a slow start.
       send({ method: "textDocument/publishDiagnostics", params: { uri: new URL(process.env.FAKE_EARLY, params.rootUri + "/").href, diagnostics: diagnose("ERROR stale") } })
@@ -850,6 +857,99 @@ test("cancellation stops transient-error retry delays", async () => {
     assert.equal(attempts, 1)
   } finally {
     clearTimeout(timer)
+  }
+})
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const initializeCount = async (log) =>
+  (await readFile(log, "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map(JSON.parse).filter((entry) => entry.method === "initialize").length
+
+test("an edit does not wait out a slow start: it says the server is still starting, and later edits get its errors", async () => {
+  const root = await project({ fake: { command: ["FAKE"], extensions: [".ts"], env: { FAKE_INIT_DELAY: "1500" } } })
+  const { after, cleanup } = await start(root, { startWaitMs: 200 })
+  try {
+    await writeFile(join(root, "f.ts"), "ERROR\n")
+    const first = completed("edit", { path: "f.ts" }, { content: "Edited f.ts" })
+    const began = Date.now()
+    await after(first)
+    assert.ok(Date.now() - began < 1_200, "the edit waited for the whole start")
+    assert.match(first.result.content[1]?.text ?? first.result.content, /LSP still indexing \(fake\)/)
+    assert.doesNotMatch(JSON.stringify(first.result.content), /LSP errors detected/)
+    await sleep(1_600)
+    const second = completed("edit", { path: "f.ts" }, { content: "Edited f.ts" })
+    await after(second)
+    assert.match(JSON.stringify(second.result.content), /LSP errors detected in this file/)
+    assert.doesNotMatch(JSON.stringify(second.result.content), /still indexing/)
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("while a server reports import progress, edits and the lsp tool flag results as possibly incomplete", async () => {
+  const root = await project({ fake: { command: ["FAKE"], extensions: [".ts"], env: { FAKE_PROGRESS: "800" } } })
+  const { after, lsp, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "f.ts"), "clean\n")
+    const during = completed("edit", { path: "f.ts" }, { content: "Edited f.ts" })
+    await after(during)
+    assert.match(JSON.stringify(during.result.content), /LSP still indexing \(fake\)/)
+    const hover = await lsp.execute({ operation: "hover", path: "f.ts", line: 1, character: 1 }, {})
+    assert.match(hover.content, /LSP still indexing: fake/)
+    await sleep(900)
+    const later = completed("edit", { path: "f.ts" }, { content: "Edited f.ts" })
+    await after(later)
+    assert.equal(later.result.content, "Edited f.ts")
+    const quiet = await lsp.execute({ operation: "hover", path: "f.ts", line: 1, character: 1 }, {})
+    assert.doesNotMatch(quiet.content, /still indexing/)
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("a server limited to some agents serves only them, for edits and the lsp tool", async () => {
+  const log = join(tmpdir(), `lsp-agents-${process.pid}.log`)
+  const root = await project({ fake: { command: ["FAKE"], extensions: [".ts"], agents: ["implementer"], env: { FAKE_LOG: log } } })
+  const { after, lsp, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "f.ts"), "ERROR\n")
+    const reviewer = { ...completed("edit", { path: "f.ts" }, { content: "Edited f.ts" }), agent: "code-reviewer" }
+    await after(reviewer)
+    assert.equal(reviewer.result.content, "Edited f.ts")
+    await after({ ...completed("read", { path: "f.ts" }, { content: "" }), agent: "code-reviewer" })
+    await sleep(100)
+    assert.equal(await initializeCount(log), 0, "a server started for an agent it does not serve")
+    await assert.rejects(lsp.execute({ operation: "hover", path: "f.ts", line: 1, character: 1 }, { agent: "code-reviewer" }), /No LSP server available/)
+    const implementer = { ...completed("edit", { path: "f.ts" }, { content: "Edited f.ts" }), agent: "implementer" }
+    await after(implementer)
+    assert.match(JSON.stringify(implementer.result.content), /LSP errors detected in this file/)
+    const hover = await lsp.execute({ operation: "hover", path: "f.ts", line: 1, character: 1 }, { agent: "implementer" })
+    assert.match(hover.content, /hover 0:0/)
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+    await rm(log, { force: true })
+  }
+})
+
+test("an idle server is stopped and starts again on next use", async () => {
+  const log = join(tmpdir(), `lsp-idle-${process.pid}.log`)
+  const root = await project({ fake: { command: ["FAKE"], extensions: [".ts"], env: { FAKE_LOG: log } } })
+  const { after, cleanup } = await start(root, { idleTimeoutMs: 300 })
+  try {
+    await writeFile(join(root, "f.ts"), "ERROR\n")
+    await after(completed("edit", { path: "f.ts" }, { content: "Edited f.ts" }))
+    assert.equal(await initializeCount(log), 1)
+    await sleep(2_500)
+    const again = completed("edit", { path: "f.ts" }, { content: "Edited f.ts" })
+    await after(again)
+    assert.equal(await initializeCount(log), 2, "the idle server was not stopped and restarted")
+    assert.match(JSON.stringify(again.result.content), /LSP errors detected in this file/)
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+    await rm(log, { force: true })
   }
 })
 
