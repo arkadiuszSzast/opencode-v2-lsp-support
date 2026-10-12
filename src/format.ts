@@ -127,6 +127,52 @@ export function formatCall(call: unknown, incoming: boolean, file: string, root:
   return `${line} called at ${call.fromRanges.map((range) => location(caller, range, root)).join(", ")}`
 }
 
+/** Reads a result's file lines, or undefined when the source should not be shown. */
+export type SourceReader = (uri: string) => Promise<readonly string[] | undefined>
+
+export interface SourceOptions {
+  readonly read: SourceReader
+  /** Lines shown above and below a result when there are at most `contextUpTo` results. */
+  readonly context: number
+  readonly contextUpTo: number
+}
+
+/**
+ * Adds the code at each result to `path:line:character` lines, as grep shows a
+ * match: `path:line:character: code`. When there are few results, each also gets
+ * the lines around it (`>` marks the result's line), so the agent can act
+ * without opening the file. Lines that are not locations are kept as they are.
+ */
+export async function withSource(lines: string[], root: string, options: SourceOptions): Promise<string[]> {
+  const pattern = /(\S+):(\d+):(\d+)$/
+  const located = lines.filter((line) => pattern.test(line))
+  const wide = options.context > 0 && located.length <= options.contextUpTo
+  const out: string[] = []
+  for (const line of lines) {
+    const match = pattern.exec(line)
+    const source = match ? await options.read(resolveUri(match[1], root)) : undefined
+    const row = match ? Number(match[2]) : 0
+    // A file ending in a newline splits into a trailing empty line that is not part of the file.
+    const length = source ? (source.at(-1) === "" ? source.length - 1 : source.length) : 0
+    // A server answering for an older version of the file can point past its end.
+    if (!match || !source || row < 1 || row > length) {
+      out.push(line)
+      continue
+    }
+    out.push(`${line}: ${(source[row - 1] ?? "").trim()}`)
+    if (!wide) continue
+    const first = Math.max(1, row - options.context)
+    const last = Math.min(length, row + options.context)
+    const width = String(last).length
+    for (let n = first; n <= last; n++) out.push(`  ${n === row ? ">" : " "} ${String(n).padStart(width)}| ${source[n - 1]}`.trimEnd())
+  }
+  return out
+}
+
+function resolveUri(path: string, root: string): string {
+  return path.startsWith("/") ? path : `${root}/${path}`
+}
+
 function location(uri: string, range: unknown, root: string): string {
   const { line, character } = start(range)
   return `${displayPath(uri, root)}:${line}:${character}`

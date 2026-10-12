@@ -59,6 +59,19 @@ Every operation requires `path`. Positions are **1-based**, with UTF-16 characte
 
 The supported operation names are `goToDefinition`, `findReferences`, `hover`, `documentSymbol`, `workspaceSymbol`, `goToImplementation`, `prepareCallHierarchy`, `incomingCalls`, and `outgoingCalls`. For `workspaceSymbol`, the path selects the server; an empty query requests all symbols. Each operation depends on the server advertising the corresponding capability.
 
+Results that are locations carry their code, the way grep shows a match, so the agent can decide without opening the file. With few results (`sourceContextMaxResults`, default 10) each also gets the lines around it (`sourceContextLines`, default 2), its own line marked `>`:
+
+```text
+src/auth.ts:42:10: return validateToken(token)
+     40| function check(token: string) {
+     41|   if (!token) return false
+  >  42|   return validateToken(token)
+     43| }
+     44|
+```
+
+With more results each shows only its own line. Results in files outside the project, or past the end of a file the server has an older version of, show the location alone. Agents tend to use grep over a language server when the server answers with bare positions and every answer costs a file read; the source lines remove that cost.
+
 ## Configuration
 
 The plugin reads the V1-shaped `lsp` map from OpenCode config files. Each server takes `command` (executable and arguments), optional `extensions`, `env`, `initialization`, `agents`, and `disabled`. `agents` lists the OpenCode agents the server serves (for example only the agents that write code, to keep a heavy server off reviewers); without it every agent is served. `prewarm` (`{ "agents": [...], "file": "path" }`) starts the server in the background the first time one of those agents runs any tool, for the project holding `file` (relative to the plugin's directory), so a slow server such as `kotlin-lsp` is importing while earlier agents (planners, architects) work; it does not widen `agents`. Add `"onStart": true` to start it as soon as the plugin loads for a project, or `"onStart": ["/srv/worktrees"]` to do that only for projects under those directories (elsewhere the `agents` trigger still applies); then a pipeline step can open the project and wait for the import before any agent runs. `initialization` supplies initialization options, configuration-change settings, and answers to `workspace/configuration` requests.
@@ -81,6 +94,8 @@ Optional settings use OpenCode's object-form plugin entry:
         "requestTimeoutMs": 15000,
         "startWaitMs": 10000,
         "idleTimeoutMs": 0,
+        "sourceContextLines": 2,
+        "sourceContextMaxResults": 10,
         "debug": false
       }
     }
@@ -88,7 +103,7 @@ Optional settings use OpenCode's object-form plugin entry:
 }
 ```
 
-The values shown are the defaults. `startWaitMs` caps how long an edit waits for a server that is still starting; past it the edit returns at once with a notice and the server keeps starting in the background. `idleTimeoutMs` stops a server nobody has used for that long (0 keeps servers until the plugin unloads); the next use starts it again. `statusDir` (unset by default) makes the plugin keep one JSON file per project there, named after the project path with every character outside `A-Za-z0-9._-` replaced by `-`; it maps each server to `{ state, since, detail? }`, where `state` is `starting`, `indexing` (work-done progress open), `ready`, `broken`, or `stopped`. `diagnostics: false` disables post-edit reporting but leaves navigation available. `options.lsp` overrides server settings; `lsp: false` disables all servers. Without any enabled, configured servers, the plugin registers neither the tool nor the diagnostic hook. Reload the plugin after changing its settings.
+The values shown are the defaults. `startWaitMs` caps how long an edit waits for a server that is still starting; past it the edit returns at once with a notice and the server keeps starting in the background. `idleTimeoutMs` stops a server nobody has used for that long (0 keeps servers until the plugin unloads); the next use starts it again. `statusDir` (unset by default) makes the plugin keep one JSON file per project there, named after the project path with every character outside `A-Za-z0-9._-` replaced by `-`; it maps each server to `{ state, since, detail? }`, where `state` is `starting`, `indexing` (work-done progress open), `ready`, `broken`, or `stopped`. `sourceContextLines: 0` keeps only each result's own code line. `diagnostics: false` disables post-edit reporting but leaves navigation available. `options.lsp` overrides server settings; `lsp: false` disables all servers. Without any enabled, configured servers, the plugin registers neither the tool nor the diagnostic hook. Reload the plugin after changing its settings.
 
 ## Limitations and trust
 

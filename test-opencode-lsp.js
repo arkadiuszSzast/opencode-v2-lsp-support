@@ -502,14 +502,21 @@ test("the lsp tool runs OpenCode 1's operations with 1-based positions", async (
     assert.equal(lsp.options.codemode, false)
     assert.equal(await run({ operation: "hover", line: 2, character: 3 }), "hover 1:2")
     assert.equal(await run({ operation: "goToDefinition", line: 1, character: 1 }), "d.ts:6:4")
-    assert.equal(await run({ operation: "findReferences", line: 1, character: 1 }), "d.ts:1:1\nd.ts:3:7")
+    assert.equal(
+      await run({ operation: "findReferences", line: 1, character: 1 }),
+      ["d.ts:1:1: class Outer {", "  > 1| class Outer {", "    2|   inner() {}", "    3| }", "d.ts:3:7: }", "    1| class Outer {", "    2|   inner() {}", "  > 3| }"].join("\n"),
+    )
     assert.equal(await run({ operation: "documentSymbol" }), "Outer (class) 1:7\n  inner (): void (method) 2:3")
     assert.equal(await run({ operation: "workspaceSymbol", query: "Q" }), "ThingQ (variable) in mod lib/x.ts:10:1")
+    // Past the end of the file (the fake server answers for lines the file does not have): location only.
     assert.equal(await run({ operation: "prepareCallHierarchy", line: 4, character: 1 }), "target (function) d.ts:4:1")
     const many = (await run({ operation: "workspaceSymbol", query: "many" })).split("\n")
     assert.equal(many.length, 21)
     assert.equal(many.at(-1), "... and 5 more; use a more specific query")
-    assert.equal(await run({ operation: "incomingCalls", line: 4, character: 1 }), "caller (function) d.ts:8:1 called at d.ts:3:5")
+    assert.equal(
+      await run({ operation: "incomingCalls", line: 4, character: 1 }),
+      ["caller (function) d.ts:8:1 called at d.ts:3:5: }", "    1| class Outer {", "    2|   inner() {}", "  > 3| }"].join("\n"),
+    )
     assert.equal(await run({ operation: "outgoingCalls", line: 4, character: 1 }), "callee (function) d.ts:12:1 called at d.ts:5:9, d.ts:6:1")
     await writeFile(join(root, "imp.ts"), "IMPORTED()\n")
     assert.equal(
@@ -529,6 +536,52 @@ test("the lsp tool runs OpenCode 1's operations with 1-based positions", async (
     await assert.rejects(lsp.execute({ operation: "hover", path: "e.py", line: 1, character: 1 }, {}), /No LSP server available for this file type/)
   } finally {
     await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("navigation results carry their code line, and the lines around them when there are few", async () => {
+  const root = await project(structuredClone(FAKE))
+  await mkdir(join(root, "lib"))
+  const lines = Array.from({ length: 14 }, (_, n) => (n === 9 ? "export const ThingQ = 1" : `// line ${n + 1}`))
+  await writeFile(join(root, "lib", "x.ts"), lines.join("\n") + "\n")
+  await writeFile(join(root, "d.ts"), "class Outer {\n  inner() {}\n}\n")
+  try {
+    const { lsp, cleanup } = await start(root)
+    const run = async (input) => (await lsp.execute({ path: "d.ts", ...input }, {})).content
+    try {
+      assert.equal(
+        await run({ operation: "workspaceSymbol", query: "Q" }),
+        ["ThingQ (variable) in mod lib/x.ts:10:1: export const ThingQ = 1", "     8| // line 8", "     9| // line 9", "  > 10| export const ThingQ = 1", "    11| // line 11", "    12| // line 12"].join("\n"),
+      )
+      const many = (await run({ operation: "workspaceSymbol", query: "many" })).split("\n")
+      assert.equal(many.length, 21, "more results than sourceContextMaxResults: one line each, no surrounding lines")
+      assert.equal(many[0], "Thingmany (variable) in mod lib/x.ts:10:1: export const ThingQ = 1")
+    } finally {
+      await cleanup()
+    }
+    const narrow = await start(root, { sourceContextLines: 0 })
+    try {
+      assert.equal(
+        (await narrow.lsp.execute({ path: "d.ts", operation: "findReferences", line: 1, character: 1 }, {})).content,
+        "d.ts:1:1: class Outer {\nd.ts:3:7: }",
+      )
+    } finally {
+      await narrow.cleanup()
+    }
+    // A result outside the project shows its location only: the plugin never reads outside files.
+    await rm(join(root, "lib"), { recursive: true, force: true })
+    const outside = await mkdtemp(join(tmpdir(), "opencode-lsp-src-"))
+    await writeFile(join(outside, "x.ts"), lines.join("\n"))
+    await symlink(outside, join(root, "lib"))
+    const linked = await start(root)
+    try {
+      assert.equal((await linked.lsp.execute({ path: "d.ts", operation: "workspaceSymbol", query: "Q" }, {})).content, "ThingQ (variable) in mod lib/x.ts:10:1")
+    } finally {
+      await linked.cleanup()
+      await rm(outside, { recursive: true, force: true })
+    }
+  } finally {
     await rm(root, { recursive: true, force: true })
   }
 })

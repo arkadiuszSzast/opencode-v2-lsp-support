@@ -10,8 +10,10 @@ import {
   formatHover,
   formatLocations,
   formatWorkspaceSymbols,
+  withSource,
+  type SourceOptions,
 } from "./format.ts"
-import { requestWithRetry, within, type LspManager } from "./manager.ts"
+import { readInside, requestWithRetry, within, type LspManager } from "./manager.ts"
 
 const OPERATIONS = [
   "goToDefinition",
@@ -52,10 +54,13 @@ Every operation needs path. All except documentSymbol and workspaceSymbol also n
 
 workspaceSymbol also accepts query, a string to filter symbols by; an empty string requests all symbols. Its path only selects which language server to ask.
 
-Results use 1-based path:line:character locations relative to the project. LSP servers must be configured for the file type; if none is available, an error is returned.`
+Results use 1-based path:line:character locations relative to the project, each followed by the code on that line (\`path:line:character: code\`); when there are few results, each also shows the lines around it, the result's line marked with \`>\`. Read a file only for what these lines do not show. LSP servers must be configured for the file type; if none is available, an error is returned.`
 
 /** The OpenCode 1 `lsp` tool, with V2's `path` argument name. */
-export function lspTool(manager: LspManager, root: string) {
+/** Operations whose results are locations, shown with their source. */
+const LOCATED = new Set<Operation>(["goToDefinition", "findReferences", "workspaceSymbol", "goToImplementation", "prepareCallHierarchy", "incomingCalls", "outgoingCalls"])
+
+export function lspTool(manager: LspManager, root: string, source: { context: number; contextUpTo: number } = { context: 2, contextUpTo: 10 }) {
   return {
     name: "lsp",
     description: DESCRIPTION,
@@ -77,7 +82,8 @@ export function lspTool(manager: LspManager, root: string) {
       signal?.throwIfAborted()
       const file = await resolveFile(root, input.path)
       signal?.throwIfAborted()
-      const content = await run(manager, root, file, input, signal, agent)
+      const raw = await run(manager, root, file, input, signal, agent)
+      const content = LOCATED.has(input.operation) && raw ? (await withSource(raw.split("\n"), root, sourceOptions(root, source))).join("\n") : raw
       const busy = await manager.busyServers(file, agent)
       const notice = busy.length
         ? `\n\n(LSP still indexing: ${busy.join(", ")}; results may be incomplete, retry later if something looks missing.)`
@@ -146,6 +152,20 @@ async function run(manager: LspManager, root: string, file: string, input: Input
     default:
       throw new Error(`Unknown operation: ${String(input.operation)}`)
   }
+}
+
+/** Reads only files inside the project, so a result pointing elsewhere shows its location alone. */
+function sourceOptions(root: string, source: { context: number; contextUpTo: number }): SourceOptions {
+  const cache = new Map<string, Promise<readonly string[] | undefined>>()
+  const read = (path: string) => {
+    let lines = cache.get(path)
+    if (!lines) {
+      lines = readInside(root, resolve(path)).then((text) => text.split(/\r?\n/), () => undefined)
+      cache.set(path, lines)
+    }
+    return lines
+  }
+  return { read, context: source.context, contextUpTo: source.contextUpTo }
 }
 
 function callItems(items: unknown[], root: string): string[] {

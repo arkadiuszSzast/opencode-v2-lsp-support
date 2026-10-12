@@ -32,6 +32,10 @@ export interface Settings {
   readonly idleTimeoutMs: number
   /** Directory for per-project server state files, so scripts can wait for an import to finish. */
   readonly statusDir?: string
+  /** Lines of source shown above and below each navigation result when there are few; 0 shows only the result's own line. */
+  readonly sourceContextLines: number
+  /** Results up to which navigation answers get surrounding lines; beyond it each result shows only its own line. */
+  readonly sourceContextMaxResults: number
   readonly debug: boolean
 }
 
@@ -58,6 +62,8 @@ export function resolveSettings(directory: string, options: Record<string, unkno
     startWaitMs: positive(options.startWaitMs, 10_000),
     idleTimeoutMs: positive(options.idleTimeoutMs, 0),
     statusDir: typeof options.statusDir === "string" && options.statusDir !== "" ? resolve(options.statusDir) : undefined,
+    sourceContextLines: nonNegative(options.sourceContextLines, 2),
+    sourceContextMaxResults: nonNegative(options.sourceContextMaxResults, 10),
     debug,
   }
 }
@@ -203,6 +209,10 @@ function onStart(value: unknown): true | string[] | undefined {
 
 function strings(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []
+}
+
+function nonNegative(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : fallback
 }
 
 function positive(value: unknown, fallback: number): number {

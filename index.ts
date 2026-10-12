@@ -18,7 +18,7 @@ export default {
     if (settings.servers.length === 0) return
 
     const manager = new LspManager(settings, root)
-    const tools = await ctx.tool.transform((editor: any) => editor.add(lspTool(manager, root)))
+    const tools = await ctx.tool.transform((editor: any) => editor.add(lspTool(manager, root, { context: settings.sourceContextLines, contextUpTo: settings.sourceContextMaxResults })))
     const hook = await ctx.tool.hook("execute.after", afterTool(manager, root, settings.diagnostics, settings.servers))
     for (const server of settings.servers) {
       if (server.prewarm && startsOnLoad(server, root)) void manager.prewarm(server, absolute(root, server.prewarm.file))

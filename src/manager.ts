@@ -71,7 +71,7 @@ export async function insideProject(root: string, file: string): Promise<boolean
  * Reads a project file, checking the file that was opened rather than the path,
  * so a symlink swapped between the check and the read cannot send outside contents.
  */
-async function readInside(root: string, file: string): Promise<string> {
+export async function readInside(root: string, file: string): Promise<string> {
   const outside = new Error(`${file} is outside the project directory ${root}.`)
   if (!within(root, file)) throw outside
   const handle = await open(file, "r")
